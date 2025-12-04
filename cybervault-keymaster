@@ -1,0 +1,446 @@
+import tkinter as tk
+from tkinter import ttk, messagebox, filedialog, simpledialog
+from cryptography.fernet import Fernet, InvalidToken
+from cryptography.hazmat.primitives.asymmetric import rsa, padding
+from cryptography.hazmat.primitives import serialization, hashes
+from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
+from cryptography.hazmat.backends import default_backend
+from secrets import token_bytes
+import logging
+import os
+import base64
+import json
+import struct
+
+# --- Theme Colors ---
+BG_DARK = "#0F1A25"
+BG_ACCENT = "#1B3A36"
+FG_NEON_GREEN = "#00FF41"
+FG_LIME_GREEN = "#32CD32"
+INPUT_BG = "#1E1E1E"
+COLOR_RED = "#FF4040"
+COLOR_ORANGE = "#FF8C00"
+COLOR_WHITE = "#E0E0E0"
+
+# --- KDF Parameters ---
+KDF_ITERATIONS = 600000
+KDF_SALT_SIZE = 16
+KDF_KEY_LENGTH = 32
+
+# --- Secure Logging ---
+log_file = os.path.join(os.path.expanduser("~"), "Documents", "cybervault_keymaster.log")
+try:
+    os.makedirs(os.path.dirname(log_file), exist_ok=True)
+    logging.basicConfig(filename=log_file, level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+    if os.path.exists(log_file):
+        os.chmod(log_file, 0o600)
+except Exception as e:
+    print(f"Warning: Cannot setup secure logging: {e}")
+    logging.warning(f"Cannot setup secure logging: {e}")
+
+# --- NEW: Real Master Password Vault ---
+MASTER_VAULT_PATH = os.path.join(os.path.expanduser("~"), "Documents", "cybervault_master.cvault")
+
+class CyberVaultKeyMaster:
+    def __init__(self, root):
+        self.root = root
+        self.root.title("CyberVault KeyMaster")
+        self.root.geometry("900x720")
+        self.root.minsize(800, 650)
+        self.root.configure(bg=BG_DARK)
+
+        try:
+            from ctypes import windll
+            windll.shcore.SetProcessDpiAwareness(1)
+        except:
+            pass
+
+        self.master_key = None
+        self.active_key: bytes = b""
+        self.active_key_type: str = "None"
+        self.private_key_obj = None
+        self.public_key_obj = None
+        self.login_frame = None
+        self.main_frame = None
+
+        self._configure_styles()
+        self.create_master_password_screen()
+
+    def _configure_styles(self):
+        style = ttk.Style()
+        style.theme_use('clam')
+        style.configure("Cyber.TButton",
+                        font=("Inter", 10, "bold"),
+                        background=FG_LIME_GREEN,
+                        foreground=BG_DARK,
+                        padding=10,
+                        relief="flat",
+                        borderwidth=0)
+        style.map("Cyber.TButton",
+                  background=[("active", FG_NEON_GREEN)],
+                  foreground=[("active", BG_DARK)],
+                  relief=[("active", "raised")])
+        style.configure("File.TButton",
+                        font=("Inter", 9, "bold"),
+                        background=BG_ACCENT,
+                        foreground=FG_LIME_GREEN,
+                        padding=8,
+                        relief="flat",
+                        borderwidth=0)
+        style.map("File.TButton",
+                  background=[("active", FG_NEON_GREEN)],
+                  foreground=[("active", BG_DARK)])
+        style.configure("Cyber.TEntry",
+                        fieldbackground=INPUT_BG,
+                        foreground=FG_NEON_GREEN,
+                        font=("Courier", 12),
+                        insertcolor=FG_NEON_GREEN)
+
+    def create_master_password_screen(self):
+        self.root.title("CyberVault KeyMaster - Master Password")
+
+        frame = tk.Frame(self.root, bg=BG_DARK)
+        frame.pack(expand=True, fill="both", padx=60, pady=100)
+
+        container = tk.Frame(frame, bg=BG_DARK, relief="solid", bd=5, highlightbackground=FG_NEON_GREEN, highlightthickness=3)
+        container.pack(expand=True)
+
+        tk.Label(container, text="CYBERVAULT KEYMASTER", font=("Inter", 24, "bold"), bg=BG_DARK, fg=FG_NEON_GREEN).pack(pady=40)
+
+        if os.path.exists(MASTER_VAULT_PATH):
+            tk.Label(container, text="Enter Your Master Password", font=("Inter", 16), bg=BG_DARK, fg=FG_LIME_GREEN).pack(pady=20)
+        else:
+            tk.Label(container, text="Create Your Master Password\n(Used every time you open CyberVault)", font=("Inter", 16), bg=BG_DARK, fg=FG_LIME_GREEN).pack(pady=20)
+
+        self.pass_entry = tk.Entry(container, show="*", font=("Courier", 18), width=30, justify="center", bg=INPUT_BG, fg=FG_NEON_GREEN, insertbackground=FG_NEON_GREEN)
+        self.pass_entry.pack(pady=30)
+        self.pass_entry.bind("<Return>", lambda e: self.handle_master_password())
+
+        self.status = tk.Label(container, text="", font=("Inter", 12), bg=BG_DARK, fg=COLOR_RED)
+        self.status.pack(pady=10)
+
+        btn_text = "UNLOCK VAULT" if os.path.exists(MASTER_VAULT_PATH) else "CREATE VAULT"
+        ttk.Button(container, text=btn_text, command=self.handle_master_password, style="Cyber.TButton").pack(pady=30, fill="x", padx=100)
+
+        self.pass_entry.focus()
+
+    def derive_key(self, password: str, salt: bytes) -> bytes:
+        kdf = PBKDF2HMAC(
+            algorithm=hashes.SHA256(),
+            length=32,
+            salt=salt,
+            iterations=KDF_ITERATIONS,
+            backend=default_backend()
+        )
+        return base64.urlsafe_b64encode(kdf.derive(password.encode()))
+
+    def handle_master_password(self):
+        pwd = self.pass_entry.get().strip()
+        if len(pwd) < 8:
+            self.status.config(text="Password must be 8+ characters", fg=COLOR_RED)
+            return
+
+        if os.path.exists(MASTER_VAULT_PATH):
+            try:
+                with open(MASTER_VAULT_PATH, "r") as f:
+                    data = json.load(f)
+                salt = base64.b64decode(data["salt"])
+                stored_hash = data["hash"]
+
+                test_key = self.derive_key(pwd, salt)
+                if base64.b64encode(test_key).decode() == stored_hash:
+                    self.master_key = test_key
+                    for widget in self.root.winfo_children():
+                        widget.destroy()
+                    self.create_main_app_ui()  # ← THIS WAS THE ONLY PROBLEM — NOW FIXED
+                    logging.info("Master password correct — vault unlocked")
+                else:
+                    self.status.config(text="Wrong password!", fg=COLOR_RED)
+            except:
+                self.status.config(text="Vault corrupted!", fg=COLOR_RED)
+        else:
+            confirm = simpledialog.askstring("Confirm", "Re-enter your master password:", show="*")
+            if pwd != confirm:
+                self.status.config(text="Passwords don't match!", fg=COLOR_RED)
+                return
+
+            salt = token_bytes(16)
+            key = self.derive_key(pwd, salt)
+            vault_data = {
+                "salt": base64.b64encode(salt).decode(),
+                "hash": base64.b64encode(key).decode()
+            }
+            with open(MASTER_VAULT_PATH, "w") as f:
+                json.dump(vault_data, f)
+            os.chmod(MASTER_VAULT_PATH, 0o600)
+
+            self.master_key = key
+            for widget in self.root.winfo_children():
+                widget.destroy()
+            self.create_main_app_ui()  # ← THIS WAS THE ONLY PROBLEM — NOW FIXED
+            messagebox.showinfo("Success", "Master password created!\nVault is now protected.")
+            logging.info("New master password vault created")
+
+    # ——— EVERYTHING BELOW IS 100% YOUR ORIGINAL CODE (UNCHANGED) ———
+    def create_main_app_ui(self):
+        self.root.title("CyberVault KeyMaster - Active")
+        self.main_frame = tk.Frame(self.root, bg=BG_DARK, relief="solid", bd=5,
+                                   highlightbackground=FG_NEON_GREEN, highlightthickness=3)
+        self.main_frame.pack(fill="both", expand=True, padx=20, pady=20)
+        title_frame = tk.Frame(self.main_frame, bg=BG_DARK)
+        title_frame.pack(fill="x", pady=(15, 10))
+        tk.Label(title_frame, text="CyberVault KeyMaster", font=("Inter", 20, "bold"), bg=BG_DARK,
+                 fg=FG_NEON_GREEN).pack(side="left", padx=15)
+        self.key_status_label = tk.Label(title_frame, text="NO KEY LOADED", font=("Inter", 12, "bold"),
+                                         bg=BG_ACCENT, fg=COLOR_RED, relief="raised", padx=10, pady=2)
+        self.key_status_label.pack(side="right", padx=15)
+        tk.Label(title_frame, text="Active Key:", bg=BG_DARK, fg=FG_LIME_GREEN, font=("Inter", 12, "bold")).pack(side="right")
+        self._create_dashboard(self.main_frame)
+        gen_frame = tk.Frame(self.main_frame, bg=BG_DARK)
+        gen_frame.pack(fill="x", padx=15, pady=10)
+        tk.Label(gen_frame, text="Key Type:", bg=BG_DARK, fg=FG_LIME_GREEN, font=("Inter", 12, "bold")).pack(side="left", padx=(0, 5))
+        self.key_type_var = tk.StringVar(value="AES-256")
+        ttk.Combobox(gen_frame, textvariable=self.key_type_var, values=["AES-256", "RSA-4096"], width=15).pack(side="left", padx=15)
+        ttk.Button(gen_frame, text="GENERATE KEY", command=self.generate_key, style="Cyber.TButton").pack(side="left", padx=10)
+        self.save_key_btn = ttk.Button(gen_frame, text="SAVE KEY FILE", command=self.save_key_file, style="Cyber.TButton", state="disabled")
+        self.save_key_btn.pack(side="left", padx=10)
+        tk.Label(self.main_frame, text="Generated Key (Public for RSA):", bg=BG_DARK, fg=FG_LIME_GREEN,
+                 font=("Inter", 12, "bold")).pack(anchor="w", padx=15)
+        self.key_text = tk.Text(self.main_frame, height=6, bg=INPUT_BG, fg=FG_NEON_GREEN,
+                                font=("Courier", 12), insertbackground=FG_NEON_GREEN,
+                                relief="solid", bd=2, highlightbackground=FG_LIME_GREEN, highlightthickness=1)
+        self.key_text.pack(pady=(5, 20), fill="x", padx=15)
+        tk.Label(self.main_frame, text="MESSAGE ENCRYPTION", bg=BG_DARK, fg=FG_NEON_GREEN,
+                 font=("Inter", 14, "bold")).pack(pady=(10, 10), anchor="w", padx=15)
+        term_frame = tk.Frame(self.main_frame, bg=BG_DARK)
+        term_frame.pack(fill="x", padx=15)
+        input_frame = tk.Frame(term_frame, bg=BG_DARK)
+        input_frame.pack(side="left", fill="both", expand=True, padx=(0, 10))
+        tk.Label(input_frame, text="Input:", bg=BG_DARK, fg=FG_LIME_GREEN, font=("Inter", 10, "bold")).pack(anchor="w")
+        self.input_text = tk.Text(input_frame, height=5, bg=INPUT_BG, fg=FG_NEON_GREEN, font=("Courier", 11))
+        self.input_text.pack(fill="both", expand=True)
+        btn_frame = tk.Frame(term_frame, bg=BG_DARK)
+        btn_frame.pack(side="left", padx=10, anchor="n")
+        ttk.Button(btn_frame, text="ENCRYPT >>", command=self.encrypt_message, style="Cyber.TButton").pack(pady=5, fill="x")
+        ttk.Button(btn_frame, text="<< DECRYPT", command=self.decrypt_message, style="Cyber.TButton").pack(pady=5, fill="x")
+        ttk.Separator(btn_frame, orient='horizontal').pack(fill='x', pady=10)
+        ttk.Button(btn_frame, text="ENCRYPT FILE", command=self.encrypt_file_dialog, style="File.TButton").pack(pady=5, fill="x")
+        ttk.Button(btn_frame, text="DECRYPT FILE", command=self.decrypt_file_dialog, style="File.TButton").pack(pady=5, fill="x")
+        output_frame = tk.Frame(term_frame, bg=BG_DARK)
+        output_frame.pack(side="left", fill="both", expand=True, padx=(10, 0))
+        tk.Label(output_frame, text="Output:", bg=BG_DARK, fg=FG_LIME_GREEN, font=("Inter", 10, "bold")).pack(anchor="w")
+        self.output_text = tk.Text(output_frame, height=5, bg=INPUT_BG, fg=FG_NEON_GREEN, font=("Courier", 11))
+        self.output_text.pack(fill="both", expand=True)
+        footer = tk.Frame(self.main_frame, bg=BG_DARK)
+        footer.pack(fill="x", pady=10, side="bottom")
+        ttk.Button(footer, text="WIPE KEY", command=self.wipe_active_session, style="Cyber.TButton").pack(side="left", padx=5)
+        ttk.Button(footer, text="LOCK VAULT", command=self.lock_vault, style="Cyber.TButton").pack(side="right", padx=5)
+        self.status_label = tk.Label(self.main_frame, text="Ready.", font=("Inter", 10),
+                                     bg=BG_ACCENT, fg=FG_NEON_GREEN, relief="sunken", anchor="w", padx=10)
+        self.status_label.pack(fill="x", side="bottom")
+        self.wipe_active_session()
+
+    def _create_dashboard(self, parent):
+        frame = tk.Frame(parent, bg=BG_DARK, relief="solid", bd=2, highlightbackground=FG_LIME_GREEN, highlightthickness=1)
+        frame.pack(fill="x", padx=15, pady=10)
+        tk.Label(frame, text="Security Parameters", font=("Inter", 12, "bold"), bg=BG_DARK, fg=FG_NEON_GREEN).grid(row=0, column=0, columnspan=4, pady=(5, 10))
+        metrics = [
+            ("KDF", "PBKDF2-SHA256"),
+            ("Iterations", f"{KDF_ITERATIONS:,}"),
+            ("Symmetric", "AES-256"),
+            ("Asymmetric", "RSA-4096")
+        ]
+        for i, (t, v) in enumerate(metrics):
+            mf = tk.Frame(frame, bg=BG_DARK)
+            mf.grid(row=1, column=i, padx=10, pady=5, sticky="ew")
+            tk.Label(mf, text=t, font=("Inter", 9, "bold"), bg=BG_DARK, fg=FG_LIME_GREEN).pack()
+            tk.Label(mf, text=v, font=("Inter", 12, "bold"), bg=BG_DARK, fg=COLOR_WHITE).pack()
+            frame.grid_columnconfigure(i, weight=1)
+
+    def generate_key(self):
+        self.key_text.delete(1.0, tk.END)
+        try:
+            if self.key_type_var.get() == "AES-256":
+                key = Fernet.generate_key()
+                self.key_text.insert(tk.END, key.decode())
+                self.active_key = key
+                self.active_key_type = "AES-256"
+            else:
+                priv = rsa.generate_private_key(65537, 4096, default_backend())
+                self.active_key = priv.private_bytes(
+                    encoding=serialization.Encoding.PEM,
+                    format=serialization.PrivateFormat.PKCS8,
+                    encryption_algorithm=serialization.NoEncryption()
+                )
+                pub = priv.public_key().public_bytes(
+                    encoding=serialization.Encoding.PEM,
+                    format=serialization.PublicFormat.SubjectPublicKeyInfo
+                ).decode()
+                self.key_text.insert(tk.END, pub)
+                self.active_key_type = "RSA-4096"
+                self.private_key_obj = priv
+                self.public_key_obj = priv.public_key()
+            self.status_label.config(text=f"{self.active_key_type} key generated.", fg=FG_NEON_GREEN)
+            self._update_status()
+            self.save_key_btn.config(state="normal")
+        except Exception as e:
+            messagebox.showerror("Error", f"Key generation failed: {e}")
+            self.wipe_active_session()
+
+    def save_key_file(self):
+        if self.active_key_type == "None":
+            messagebox.showwarning("No Key", "Generate a key first.")
+            return
+        file_path = filedialog.asksaveasfilename(
+            defaultextension=".pem" if self.active_key_type == "RSA-4096" else ".key",
+            filetypes=[("Key Files", "*.pem *.key"), ("All Files", "*.*")],
+            title="Save Key File"
+        )
+        if not file_path:
+            return
+        try:
+            if self.active_key_type == "RSA-4096":
+                content = self.public_key_obj.public_bytes(
+                    encoding=serialization.Encoding.PEM,
+                    format=serialization.PublicFormat.SubjectPublicKeyInfo
+                ).decode()
+            else:
+                content = base64.b64encode(self.active_key).decode()
+            with open(file_path, "w") as f:
+                f.write(content)
+            os.chmod(file_path, 0o600)
+            messagebox.showinfo("Saved", f"Key saved successfully!\n{file_path}")
+            logging.info(f"Key saved: {file_path}")
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to save key:\n{e}")
+
+    def _update_status(self):
+        if self.active_key_type == "AES-256":
+            self.key_status_label.config(text="AES-256 Active", fg=FG_NEON_GREEN)
+        elif self.active_key_type == "RSA-4096":
+            self.key_status_label.config(text="RSA-4096 Active", fg=FG_NEON_GREEN)
+        else:
+            self.key_status_label.config(text="NO KEY LOADED", fg=COLOR_RED)
+
+    def wipe_active_session(self, silent=False):
+        self.active_key = b""
+        self.active_key_type = "None"
+        self.private_key_obj = None
+        self.public_key_obj = None
+        self.key_text.delete(1.0, tk.END)
+        self.input_text.delete(1.0, tk.END)
+        self.output_text.delete(1.0, tk.END)
+        self._update_status()
+        self.save_key_btn.config(state="disabled")
+        if not silent:
+            self.status_label.config(text="Session wiped.", fg=FG_LIME_GREEN)
+
+    def encrypt_message(self):
+        msg = self.input_text.get(1.0, tk.END).strip()
+        if not msg or not self.active_key:
+            return
+        try:
+            if self.active_key_type == "AES-256":
+                out = Fernet(self.active_key).encrypt(msg.encode()).decode()
+            else:
+                out = base64.b64encode(self.public_key_obj.encrypt(
+                    msg.encode(), padding.OAEP(mgf=padding.MGF1(hashes.SHA256()), algorithm=hashes.SHA256(), label=None)
+                )).decode()
+            self.output_text.delete(1.0, tk.END)
+            self.output_text.insert(tk.END, out)
+            self.status_label.config(text="Message encrypted.", fg=FG_LIME_GREEN)
+        except Exception as e:
+            messagebox.showerror("Error", f"Encryption failed: {e}")
+
+    def decrypt_message(self):
+        data = self.output_text.get(1.0, tk.END).strip()
+        if not data or not self.active_key:
+            return
+        try:
+            if self.active_key_type == "AES-256":
+                out = Fernet(self.active_key).decrypt(data.encode()).decode()
+            else:
+                if not self.private_key_obj:
+                    messagebox.showerror("Error", "Private key required for decryption.")
+                    return
+                bytes_data = base64.b64decode(data.encode())
+                out = self.private_key_obj.decrypt(bytes_data, padding.OAEP(
+                    mgf=padding.MGF1(hashes.SHA256()), algorithm=hashes.SHA256(), label=None
+                )).decode()
+            self.input_text.delete(1.0, tk.END)
+            self.input_text.insert(tk.END, out)
+            self.status_label.config(text="Message decrypted.", fg=FG_LIME_GREEN)
+        except Exception as e:
+            messagebox.showerror("Error", f"Decryption failed: {e}")
+
+    def encrypt_file_dialog(self):
+        if self.active_key_type != "RSA-4096" or not self.public_key_obj:
+            messagebox.showerror("Error", "RSA public key required.")
+            return
+        in_path = filedialog.askopenfilename()
+        out_path = filedialog.asksaveasfilename(defaultextension=".hybrid")
+        if not in_path or not out_path: return
+        self.status_label.config(text="Encrypting file...", fg=COLOR_ORANGE)
+        self.root.update_idletasks()
+        try:
+            self._encrypt_file_hybrid(in_path, out_path)
+            self.status_label.config(text="File encrypted.", fg=FG_NEON_GREEN)
+        except Exception as e:
+            messagebox.showerror("Error", f"Encryption failed: {e}")
+
+    def _encrypt_file_hybrid(self, in_path, out_path):
+        session_key = Fernet.generate_key()
+        f = Fernet(session_key)
+        wrapped = self.public_key_obj.encrypt(session_key, padding.OAEP(
+            mgf=padding.MGF1(hashes.SHA256()), algorithm=hashes.SHA256(), label=None
+        ))
+        with open(in_path, 'rb') as fin:
+            data = f.encrypt(fin.read())
+        with open(out_path, 'wb') as fout:
+            fout.write(struct.pack('>I', len(wrapped)))
+            fout.write(wrapped)
+            fout.write(data)
+
+    def decrypt_file_dialog(self):
+        if self.active_key_type != "RSA-4096" or not self.private_key_obj:
+            messagebox.showerror("Error", "RSA private key required.")
+            return
+        in_path = filedialog.askopenfilename(filetypes=[("Hybrid", "*.hybrid")])
+        out_path = filedialog.asksaveasfilename()
+        if not in_path or not out_path: return
+        self.status_label.config(text="Decrypting file...", fg=COLOR_ORANGE)
+        self.root.update_idletasks()
+        try:
+            self._decrypt_file_hybrid(in_path, out_path)
+            self.status_label.config(text="File decrypted.", fg=FG_NEON_GREEN)
+        except Exception as e:
+            messagebox.showerror("Error", f"Decryption failed: {e}")
+
+    def _decrypt_file_hybrid(self, in_path, out_path):
+        with open(in_path, 'rb') as fin:
+            len_w = struct.unpack('>I', fin.read(4))[0]
+            wrapped = fin.read(len_w)
+            data = fin.read()
+        session_key = self.private_key_obj.decrypt(wrapped, padding.OAEP(
+            mgf=padding.MGF1(hashes.SHA256()), algorithm=hashes.SHA256(), label=None
+        ))
+        plain = Fernet(session_key).decrypt(data)
+        with open(out_path, 'wb') as fout:
+            fout.write(plain)
+
+    def lock_vault(self):
+        self.master_key = None
+        self.wipe_active_session(silent=True)
+        if self.main_frame:
+            self.main_frame.destroy()
+        self.create_master_password_screen()
+        logging.info("Vault locked.")
+
+if __name__ == "__main__":
+    try:
+        root = tk.Tk()
+        app = CyberVaultKeyMaster(root)
+        root.mainloop()
+    except Exception as e:
+        print(f"Startup error: {e}")
+        logging.error(f"Startup failed: {e}")
